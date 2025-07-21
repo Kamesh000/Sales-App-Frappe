@@ -3,9 +3,11 @@ from frappe.www.printview import get_print_style, get_visible_columns
 from frappe.utils.pdf import get_pdf
 from frappe.utils.file_manager import save_file
 import frappe.desk.query_report
+from erpnext.stock.get_item_details import get_item_details
 # from erpnext.accounts.utils import get_exchange_rate 
 
 # from frappe.utils.print_format import get_print_style
+
 
 
 @frappe.whitelist()
@@ -15,53 +17,65 @@ def search_item_details():
         limit = int(frappe.form_dict.get("limit", 100))
         offset = int(frappe.form_dict.get("offset", 0))
         perm_item_code = frappe.form_dict.get("item_code", "")
+        qty = frappe.form_dict.get("qty") or ''
+        uom = frappe.form_dict.get("uom") or ''
         user = frappe.session.user
 
         customer = frappe.db.get_value("Customer", [["Portal User","user","=",user]], "name")
         if not customer:
             frappe.throw("No Customer linked to this user.")
 
-
         filters = [["disabled", "=", 0]]
         if perm_item_code:
             filters.append(["name", "=", perm_item_code])
-            
         elif search:
             filters.append(["item_name", "like", f"%{search}%"])
 
         items = frappe.get_all(
             "Item",
             filters=filters,
-            fields=["name", "item_name","stock_uom", "description", "image", "item_group"],
+            fields=["name", "item_name", "stock_uom", "description", "image", "item_group", "brand"],
             limit_page_length=limit,
             limit_start=offset,
             order_by="modified desc"
         )
 
-        item_codes = [item["name"] for item in items]
+        today = frappe.utils.nowdate()
+        company = frappe.defaults.get_user_default("company") or "Default Company"
 
-        # Get customer-specific price list
+        # Currency from customer or company
+        customer_currency = frappe.db.get_value("Customer", customer, "default_currency")
+        company_currency = frappe.db.get_value("Company", company, "default_currency") or "INR"
+        currency = customer_currency or company_currency
+
+        # Price List from customer or default
         price_list = frappe.db.get_value("Customer", customer, "default_price_list") or "Standard Selling"
-
-        prices = {}
-        if item_codes:
-            price_data = frappe.get_all(
-                "Item Price",
-                filters={
-                    "item_code": ["in", item_codes],
-                    "price_list": price_list
-                },
-                fields=["item_code", "price_list_rate"]
-            )
-            for p in price_data:
-                prices[p.item_code] = p.price_list_rate
+        price_list_currency = frappe.db.get_value("Price List", price_list, "currency") or "INR"
 
         results = []
+
         for item in items:
             item_code = item["name"]
-            price = prices.get(item_code)
 
-            # Get videos
+            item_args = {
+                "item_code": item_code,
+                "customer": customer,
+                "currency": currency,
+                "conversion_rate": 1,
+                "price_list": price_list,
+                "price_list_currency": price_list_currency,
+                "plc_conversion_rate": 1,
+                "company": company,
+                "order_type": "Sales",
+                "ignore_pricing_rule": 0,
+                "doctype": "Sales Order",
+                "qty": qty,
+                "uom":uom if uom else ""
+            }
+
+            item_detail = get_item_details(item_args)
+
+            # Videos
             videos = frappe.get_all(
                 "File",
                 filters={
@@ -72,7 +86,7 @@ def search_item_details():
                 fields=["file_url"]
             )
 
-            # Get other images
+            # Images
             all_images = frappe.get_all(
                 "File",
                 filters={
@@ -82,15 +96,15 @@ def search_item_details():
                 },
                 fields=["file_url"]
             )
+
+            # UOM Prices
             uoms = frappe.get_all(
                 "UOM Conversion Detail",
                 filters={"parent": item_code},
                 fields=["uom", "conversion_factor"]
             )
-            # Include stock_uom by default
             uoms.insert(0, {"uom": item["stock_uom"], "conversion_factor": 1.0})
-            
-            # Get price for each UOM
+
             uom_prices = []
             for uom_entry in uoms:
                 uom_name = uom_entry["uom"]
@@ -105,32 +119,74 @@ def search_item_details():
                     "price": item_price if item_price else 0.0
                 })
 
+            # Pricing Rules
+            promotions = []
+            # frappe.log_error('error',item_detail)
+            if item_detail.get("pricing_rules"):
+                pricing_rule_names = item_detail.get("pricing_rules")
+                # frappe.log_error('price rule', json.loads(pricing_rule_names))
+
+                for rule_name in json.loads(pricing_rule_names):
+                    rule_doc = frappe.get_doc("Pricing Rule", rule_name).as_dict()
+                    promotions.append(rule_doc)
+
+            if item_detail.get("free_item_data"):
+                i_code = item_detail.get("free_item_data")
+                # frappe.log_error('price rule', json.loads(pricing_rule_names))
+
+                for rule_name in json.loads(pricing_rule_names):
+                    rule_doc = frappe.get_doc("Pricing Rule", rule_name).as_dict()
+                    promotions.append(rule_doc)
+                    # promotions.append({
+                    #     "rule_name": rule_doc.name,
+                    #     "apply_on": rule_doc.apply_on,
+                    #     "discount_type": rule_doc.price_or_product_discount,
+                    #     "discount_value": rule_doc.discount_percentage or rule_doc.rate_or_discount,
+                    #     "free_item": rule_doc.free_item,
+                    #     "min_qty": rule_doc.min_qty,
+                    #     "max_qty": rule_doc.max_qty
+                    # })
+
+            # Final result
             results.append({
                 "item_code": item_code,
                 "item_name": item["item_name"],
                 "description": item["description"],
                 "item_group": item["item_group"],
+                "brand": item["brand"],
                 "uom": item["stock_uom"],
                 "image": item["image"],
-                "price": price if price else 0.0,
+                "price": item_detail.get("price_list_rate", 0.0),
+                "discount_percentage": item_detail.get("discount_percentage", 0.0),
+                "rate": item_detail.get("rate", 0.0),
+                "net_rate": item_detail.get("net_rate", 0.0),
+                "amount": item_detail.get("amount", 0.0),
+                "taxes": item_detail.get("item_tax_rate", {}),
+                "margin_type": item_detail.get("margin_type"),
+                "margin_rate_or_amount": item_detail.get("margin_rate_or_amount"),
                 "uom_prices": uom_prices,
                 "videos": [v["file_url"] for v in videos],
                 "images": [img["file_url"] for img in all_images],
-            })
 
-        frappe.response.message={
-            'status':True,
-            'data':results
+                # "has_pricing_rule": item_detail.get("has_pricing_rule")
+                # "pricing_rules":item_detail.get("pricing_rules", [])
+                # "pricing_rule_for": item_detail.get("pricing_rule_for", []),
+
+                "promotions": promotions,
+                "free_items": item_detail.get("free_item_data", [])
+            })
+        frappe.log_error('item details',results)
+        frappe.response.message = {
+            "status": True,
+            "data": results
         }
 
     except Exception as e:
         frappe.log_error(title="Get Customer Items Error", message=f"{e}")
-        # frappe.throw(_("Error fetching items: ") + str(e))
-        frappe.response.message={
-            'status':False,
-            'data':f"{e}"
+        frappe.response.message = {
+            "status": False,
+            "data": f"{e}"
         }
-
 
 @frappe.whitelist()
 def general_ledger_report_pdf(from_date, to_date):
