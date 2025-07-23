@@ -3,7 +3,7 @@ from frappe.www.printview import get_print_style, get_visible_columns
 from frappe.utils.pdf import get_pdf
 from frappe.utils.file_manager import save_file
 import frappe.desk.query_report
-
+import json
 # from frappe.utils.print_format import get_print_style
 
 
