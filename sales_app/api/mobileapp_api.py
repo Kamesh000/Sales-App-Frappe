@@ -4,6 +4,8 @@ from frappe.utils.pdf import get_pdf
 from frappe.utils.file_manager import save_file
 import frappe.desk.query_report
 from erpnext.stock.get_item_details import get_item_details
+import json
+
 # from erpnext.accounts.utils import get_exchange_rate 
 
 # from frappe.utils.print_format import get_print_style
